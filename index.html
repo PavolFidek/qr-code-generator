@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="sk">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QR Platby</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link 
+        rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;500;600;700&display=swap">
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+
+<body>
+
+    <header>
+        <div class="header-title">
+            <h1>QR Platby</h1>
+            <p>Generátor SK Pay QR kódov pre s.r.o.</p>
+        </div>
+        <div class="header-badge">SK Pay · SEPA · EUR</div>
+    </header>
+
+    <main>
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('pdf')">PDF od účtovníka</button>
+            <button class="tab" onclick="switchTab('email')">Z e-mailu / textu</button>
+            <button class="tab" onclick="switchTab('manual')">Ručné zadanie</button>
+        </div>
+
+        <!-- PDF TAB -->
+        <div id="tab-pdf">
+            <div class="label">Nahraj PDF súbor</div>
+            <div class="drop-zone" id="dropZone">
+                <input type="file" accept=".pdf,application/pdf" id="pdfFile" onchange="onFileChosen(this)">
+                <div class="drop-icon">📄</div>
+                <div class="drop-title">Pretiahni PDF sem alebo klikni pre výber</div>
+                <div class="drop-sub">Podporované: PDF s textom aj naskenované (cez AI)</div>
+            </div>
+            <div id="fileChosen" style="display:none;" class="file-chosen">
+                <span class="file-chosen-name" id="fileChosenName"></span>
+                <button class="file-chosen-clear" onclick="clearPdf()" title="Odstrániť">×</button>
+            </div>
+            <div class="hint">AI prečíta celý PDF vrátane tabuliek a automaticky vytiahne platobné údaje.</div>
+
+            <div class="api-row">
+                <label>Anthropic API kľúč</label>
+                <input type="password" id="apiKeyPdf" placeholder="sk-ant-..." autocomplete="off">
+                <div class="api-note">Kľúč sa nikam neposiela — komunikuje priamo z tvojho prehliadača na Anthropic API.
+                    Získaš ho na console.anthropic.com</div>
+            </div>
+
+            <div class="btn-row">
+                <button class="btn primary" id="btnParsePdf" onclick="parsePdf()">Extrahovať platby →</button>
+                <button class="btn" onclick="clearPdf()">Vymazať</button>
+            </div>
+            <div id="statusPdf" class="status-line"></div>
+        </div>
+
+        <!-- EMAIL TAB -->
+        <div id="tab-email" style="display:none;">
+            <div class="label">Obsah e-mailu od účtovníka</div>
+            <textarea id="emailInput" placeholder="Sem vlož text e-mailu...
+
+Príklad:
+DPH: IBAN SK89 1100 0000 0026 2700 8021, VS 2024001, suma 840 EUR
+Sociálna poisťovňa: SK71 8180 0000 0070 0071 5025, suma 245.60 EUR
+Zdravotné: SK40 7500 0000 0040 0814 4399, suma 89.32 EUR"></textarea>
+            <div class="hint">Funguje s tabuľkami, zoznamami aj voľným textom. AI extrahuje IBAN, sumu a variabilný
+                symbol.</div>
+
+            <div class="api-row">
+                <label>Anthropic API kľúč</label>
+                <input type="password" id="apiKeyEmail" placeholder="sk-ant-..." autocomplete="off">
+                <div class="api-note">Kľúč sa nikam neposiela — komunikuje priamo z tvojho prehliadača na Anthropic API.
+                </div>
+            </div>
+
+            <div class="btn-row">
+                <button class="btn primary" onclick="parseEmail()">Extrahovať platby →</button>
+                <button class="btn" onclick="clearEmail()">Vymazať</button>
+            </div>
+            <div id="statusEmail" class="status-line"></div>
+        </div>
+
+        <!-- MANUAL TAB -->
+        <div id="tab-manual" style="display:none;">
+            <div id="manualForms"></div>
+            <div class="btn-row">
+                <button class="btn" onclick="addManualForm()">+ Pridať platbu</button>
+                <button class="btn primary" onclick="generateManual()">Generovať QR kódy →</button>
+            </div>
+        </div>
+
+        <div id="results"></div>
+    </main>
+
+    <script>
+        let payments = [];
+        let manualIdx = 0;
+        let chosenPdfB64 = null;
+
+        /* ---- TABS ---- */
+        function switchTab(t) {
+            ['pdf', 'email', 'manual'].forEach((name, i) => {
+                document.querySelectorAll('.tab')[i].classList.toggle('active', name === t);
+                document.getElementById('tab-' + name).style.display = name === t ? '' : 'none';
+            });
+            if (t === 'manual' && document.querySelectorAll('.manual-form').length === 0) addManualForm();
+        }
+
+        /* ---- PDF ---- */
+        const dropZone = document.getElementById('dropZone');
+        dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+        dropZone.addEventListener('drop', e => {
+            e.preventDefault(); dropZone.classList.remove('drag-over');
+            const file = e.dataTransfer.files[0];
+            if (file && file.type === 'application/pdf') loadPdfFile(file);
+        });
+
+        function onFileChosen(input) {
+            const file = input.files[0];
+            if (file) loadPdfFile(file);
+        }
+
+        function loadPdfFile(file) {
+            const reader = new FileReader();
+            reader.onload = e => {
+                chosenPdfB64 = e.target.result.split(',')[1];
+                document.getElementById('fileChosenName').textContent = file.name;
+                document.getElementById('fileChosen').style.display = 'flex';
+                setPdfStatus('');
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function clearPdf() {
+            chosenPdfB64 = null;
+            document.getElementById('pdfFile').value = '';
+            document.getElementById('fileChosen').style.display = 'none';
+            document.getElementById('fileChosenName').textContent = '';
+            setPdfStatus('');
+            document.getElementById('results').innerHTML = '';
+        }
+
+        function setPdfStatus(msg, cls) {
+            const el = document.getElementById('statusPdf');
+            el.textContent = msg; el.className = 'status-line' + (cls ? ' ' + cls : '');
+        }
+
+        async function parsePdf() {
+            const key = document.getElementById('apiKeyPdf').value.trim();
+            if (!chosenPdfB64) { setPdfStatus('Najprv vyber PDF súbor.', 'error'); return; }
+            if (!key) { setPdfStatus('Zadaj Anthropic API kľúč.', 'error'); return; }
+
+            setPdfStatus('Čítam PDF a extrahujem platby...', 'loading');
+            document.getElementById('results').innerHTML = '';
+            document.getElementById('btnParsePdf').disabled = true;
+
+            try {
+                const res = await fetch('https://api.anthropic.com/v1/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': key,
+                        'anthropic-version': '2023-06-01',
+                        'anthropic-dangerous-direct-browser-access': 'true'
+                    },
+                    body: JSON.stringify({
+                        model: 'claude-sonnet-4-20250514',
+                        max_tokens: 1500,
+                        system: `Si asistent na spracovanie platobných príkazov. Extrahuj VŠETKY platobné údaje z dokumentu.
+Vráť ONLY valid JSON array, no markdown, no backticks, no preamble.
+Format: [{"name":"nazov platby","iban":"SK...","amount":123.45,"vs":"variabilny symbol alebo prazdny retazec","msg":"sprava alebo prazdny retazec"}]
+IBAN normalizuj: odstran medzery, velke pismena. Amount je cislo. Ak pole chyba pouzi prazdny retazec.`,
+                        messages: [{
+                            role: 'user',
+                            content: [
+                                {
+                                    type: 'document',
+                                    source: { type: 'base64', media_type: 'application/pdf', data: chosenPdfB64 }
+                                },
+                                { type: 'text', text: 'Extrahuj všetky platby z tohto dokumentu a vráť JSON array.' }
+                            ]
+                        }]
+                    })
+                });
+
+                document.getElementById('btnParsePdf').disabled = false;
+
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    setPdfStatus('Chyba API: ' + (err.error?.message || res.status), 'error');
+                    return;
+                }
+
+                const data = await res.json();
+                const raw = data.content?.find(c => c.type === 'text')?.text || '[]';
+                const clean = raw.replace(/```json|```/g, '').trim();
+                payments = JSON.parse(clean);
+
+                if (payments.length === 0) {
+                    setPdfStatus('Žiadne platby sa nenašli. Skontroluj PDF alebo skús ručné zadanie.', 'error');
+                    return;
+                }
+                setPdfStatus(`Nájdených ${payments.length} platb${payments.length === 1 ? 'a' : payments.length < 5 ? 'y' : 'í'}.`);
+                renderPayments();
+            } catch (e) {
+                document.getElementById('btnParsePdf').disabled = false;
+                setPdfStatus('Chyba: ' + e.message, 'error');
+            }
+        }
+
+        /* ---- EMAIL ---- */
+        function setEmailStatus(msg, cls) {
+            const el = document.getElementById('statusEmail');
+            el.textContent = msg; el.className = 'status-line' + (cls ? ' ' + cls : '');
+        }
+
+        async function parseEmail() {
+            const text = document.getElementById('emailInput').value.trim();
+            const key = document.getElementById('apiKeyEmail').value.trim();
+            if (!text) { setEmailStatus('Vlož text e-mailu.', 'error'); return; }
+            if (!key) { setEmailStatus('Zadaj Anthropic API kľúč.', 'error'); return; }
+
+            setEmailStatus('Analysujem e-mail...', 'loading');
+            document.getElementById('results').innerHTML = '';
+
+            try {
+                const res = await fetch('https://api.anthropic.com/v1/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': key,
+                        'anthropic-version': '2023-06-01',
+                        'anthropic-dangerous-direct-browser-access': 'true'
+                    },
+                    body: JSON.stringify({
+                        model: 'claude-sonnet-4-20250514',
+                        max_tokens: 1000,
+                        system: `Extrahuj platobné údaje z textu. Vráť ONLY valid JSON array, no markdown, no backticks, no explanation.
+Format: [{"name":"nazov platby","iban":"SK...","amount":123.45,"vs":"variabilny symbol alebo prazdny retazec","msg":"sprava alebo prazdny retazec"}]
+IBAN normalizuj - odstran medzery, velke pismena. Amount je cislo (float). Ak nieco chyba, pouzi prazdny retazec.`,
+                        messages: [{ role: 'user', content: text }]
+                    })
+                });
+
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    setEmailStatus('Chyba API: ' + (err.error?.message || res.status), 'error');
+                    return;
+                }
+                const data = await res.json();
+                const raw = data.content?.find(c => c.type === 'text')?.text || '[]';
+                payments = JSON.parse(raw.replace(/```json|```/g, '').trim());
+
+                if (payments.length === 0) {
+                    setEmailStatus('Žiadne platby sa nenašli. Skús ručné zadanie.', 'error'); return;
+                }
+                setEmailStatus(`Nájdených ${payments.length} platb${payments.length === 1 ? 'a' : payments.length < 5 ? 'y' : 'í'}.`);
+                renderPayments();
+            } catch (e) {
+                setEmailStatus('Chyba: ' + e.message, 'error');
+            }
+        }
+
+        function clearEmail() {
+            document.getElementById('emailInput').value = '';
+            setEmailStatus('');
+            document.getElementById('results').innerHTML = '';
+            payments = [];
+        }
+
+        /* ---- MANUAL ---- */
+        function addManualForm() {
+            manualIdx++;
+            const id = manualIdx;
+            const div = document.createElement('div');
+            div.className = 'manual-form'; div.id = 'mf' + id;
+            div.innerHTML = `
+    <div class="manual-form-header">
+      <span class="manual-form-num">Platba ${id}</span>
+      <button class="btn small danger" onclick="removeForm(${id})">Odstrániť</button>
+    </div>
+    <div class="manual-grid" style="grid-template-columns:1fr; margin-bottom:10px;">
+      <div class="field-group">
+        <span class="field-label">Názov platby</span>
+        <input id="mn${id}" placeholder="napr. DPH, Sociálna poisťovňa...">
+      </div>
+    </div>
+    <div class="manual-grid">
+      <div class="field-group" style="grid-column:1/-1;">
+        <span class="field-label">IBAN</span>
+        <input id="mi${id}" placeholder="SK89 1100 0000 0026 2700 8021">
+      </div>
+      <div class="field-group">
+        <span class="field-label">Suma (EUR)</span>
+        <input id="ms${id}" type="number" step="0.01" min="0" placeholder="0.00">
+      </div>
+      <div class="field-group">
+        <span class="field-label">Variabilný symbol</span>
+        <input id="mv${id}" placeholder="napr. 2024001">
+      </div>
+      <div class="field-group" style="grid-column:1/-1;">
+        <span class="field-label">Správa / poznámka</span>
+        <input id="mz${id}" placeholder="nepovinné">
+      </div>
+    </div>
+  `;
+            document.getElementById('manualForms').appendChild(div);
+        }
+
+        function removeForm(id) {
+            const el = document.getElementById('mf' + id);
+            if (el) el.remove();
+        }
+
+        function generateManual() {
+            const forms = document.querySelectorAll('.manual-form');
+            payments = [];
+            forms.forEach(f => {
+                const num = f.id.replace('mf', '');
+                const name = document.getElementById('mn' + num)?.value.trim() || 'Platba';
+                const iban = document.getElementById('mi' + num)?.value.trim().replace(/\s/g, '');
+                const amtRaw = document.getElementById('ms' + num)?.value.trim();
+                const vs = document.getElementById('mv' + num)?.value.trim();
+                const msg = document.getElementById('mz' + num)?.value.trim();
+                if (!iban || !amtRaw) return;
+                const amt = parseFloat(amtRaw);
+                if (isNaN(amt) || amt <= 0) return;
+                payments.push({ name, iban, amount: amt, vs: vs || '', msg: msg || '' });
+            });
+            if (payments.length === 0) { alert('Vyplň aspoň IBAN a sumu pre jednu platbu.'); return; }
+            renderPayments();
+        }
+
+        /* ---- SK PAY ---- */
+        function buildSKPay(p) {
+            const iban = p.iban.replace(/\s/g, '');
+            let s = `PAY*HB*1*0\nACC:${iban}\nAMT:${p.amount.toFixed(2)}\nCC:EUR`;
+            if (p.vs) s += `\nVI:${p.vs}`;
+            if (p.msg) s += `\nMsg:${p.msg}`;
+            return s;
+        }
+
+        /* ---- RENDER ---- */
+        function renderPayments() {
+            const container = document.getElementById('results');
+            const total = payments.reduce((s, p) => s + p.amount, 0);
+            container.innerHTML = `
+    <hr class="divider">
+    <div class="results-header">
+      <h2>Vygenerované QR kódy</h2>
+      <span class="results-count">${payments.length} platb${payments.length === 1 ? 'a' : payments.length < 5 ? 'y' : 'í'} · celkom ${total.toLocaleString('sk-SK', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} EUR</span>
+    </div>
+  `;
+            payments.forEach((p, idx) => {
+                const card = document.createElement('div');
+                card.className = 'payment-card'; card.id = 'card' + idx;
+                const infoRows = [
+                    ['IBAN', p.iban],
+                    p.vs ? ['Var. symbol', p.vs] : null,
+                    p.msg ? ['Správa', p.msg] : null
+                ].filter(Boolean);
+                card.innerHTML = `
+      <div class="payment-info">
+        <div class="payment-name">${escHtml(p.name)}</div>
+        <div class="info-grid">
+          ${infoRows.map(([k, v]) => `<span class="info-key">${k}</span><span class="info-val">${escHtml(v)}</span>`).join('')}
+        </div>
+        <div class="amount-row">
+          <span class="amount-display" id="amtDisplay${idx}">${p.amount.toLocaleString('sk-SK', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+          <span class="amount-currency">EUR</span>
+          <div class="edit-amt">
+            <input type="number" step="0.01" min="0" value="${p.amount}" id="amtInput${idx}">
+            <button class="btn small" onclick="updateAmt(${idx})">Prepočítať</button>
+          </div>
+        </div>
+      </div>
+      <div class="qr-col">
+        <div class="qr-wrap" id="qr${idx}"></div>
+        <span class="qr-label">SK PAY</span>
+        <button class="btn small" onclick="downloadQR(${idx},'${escAttr(p.name)}')">↓ Stiahnuť PNG</button>
+      </div>
+    `;
+                container.appendChild(card);
+                setTimeout(() => makeQR(idx, p), 60 * idx + 10);
+            });
+            container.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        function makeQR(idx, p) {
+            const wrap = document.getElementById('qr' + idx);
+            if (!wrap) return;
+            wrap.innerHTML = '';
+            try {
+                new QRCode(wrap, { text: buildSKPay(p), width: 152, height: 152, correctLevel: QRCode.CorrectLevel.M });
+            } catch (e) { wrap.textContent = 'Chyba QR'; }
+        }
+
+        function updateAmt(idx) {
+            const val = parseFloat(document.getElementById('amtInput' + idx)?.value);
+            if (isNaN(val) || val <= 0) return;
+            payments[idx].amount = val;
+            const disp = document.getElementById('amtDisplay' + idx);
+            if (disp) disp.textContent = val.toLocaleString('sk-SK', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const wrap = document.getElementById('qr' + idx);
+            if (wrap) { wrap.innerHTML = ''; makeQR(idx, payments[idx]); }
+        }
+
+        function downloadQR(idx, name) {
+            const wrap = document.getElementById('qr' + idx);
+            const img = wrap?.querySelector('img');
+            const cvs = wrap?.querySelector('canvas');
+            const a = document.createElement('a');
+            a.download = 'qr_' + name.replace(/[^a-z0-9]/gi, '_').toLowerCase().replace(/_+/g, '_') + '.png';
+            if (img) a.href = img.src;
+            else if (cvs) a.href = cvs.toDataURL('image/png');
+            else return;
+            a.click();
+        }
+
+        function escHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+        function escAttr(s) { return String(s).replace(/"/g, '&quot;'); }
+    </script>
+</body>
+
+</html>
